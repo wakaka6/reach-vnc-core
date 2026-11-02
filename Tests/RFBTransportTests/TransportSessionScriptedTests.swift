@@ -256,7 +256,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -325,7 +325,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -405,7 +405,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -450,7 +450,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
             incremental: false,
@@ -489,7 +489,7 @@ final class TransportSessionScriptedTests: XCTestCase {
             ClientMessage.setPixelFormat(.bgra8888).serialize())
         expectedClientBytes.append(ClientMessage.setEncodings([
             .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
-            .desktopSize, .extendedDesktopSize,
+            .desktopSize, .extendedDesktopSize, .extendedClipboard,
         ]).serialize())
         expectedClientBytes.append(ClientMessage.framebufferUpdateRequest(
             incremental: false, x: 0, y: 0, width: 1024, height: 768
@@ -829,9 +829,10 @@ final class TransportSessionScriptedTests: XCTestCase {
             connection: connection)
         try await session.connect()
 
-        // ServerCutText declaring a ~4 GB clipboard payload.
+        // ServerCutText declaring a ~2 GB clipboard payload (a negative
+        // length would be an Extended Clipboard message).
         var cutText = Data([3, 0, 0, 0]) // type + padding(3)
-        cutText.append(contentsOf: [0xff, 0xff, 0xff, 0xfe])
+        cutText.append(contentsOf: [0x7f, 0xff, 0xff, 0xfe])
         await connection.enqueueServerBytes(cutText)
 
         let observedError = await Self.withTimeout(seconds: 2) {
@@ -845,6 +846,134 @@ final class TransportSessionScriptedTests: XCTestCase {
             return XCTFail("Expected protocolViolation, got \(String(describing: observedError))")
         }
         await session.disconnect()
+    }
+
+    /// Clipboard text outside Latin-1 must cross intact both ways once a
+    /// TigerVNC-style server announces Extended Clipboard caps: local text
+    /// is announced, then provided on request; server text is requested on
+    /// notify and decoded from its provide.
+    func testExtendedClipboardCarriesUTF8BothWays() async throws {
+        typealias Clipboard = ExtendedClipboardProtocol
+        let (session, connection) = try await Self.connectedConventionalSession()
+        var sent = await connection.sentBytes().count
+
+        // TigerVNC's caps: text, every action, and a size of 0 - it takes
+        // no unrequested text, but a request must still be answered.
+        var sizes = Data()
+        Self.appendUInt32(0, to: &sizes)
+        await connection.enqueueServerBytes(Clipboard.message(
+            type: Clipboard.serverCutTextType,
+            flags: Clipboard.capsAction | Clipboard.textFormat
+                | Clipboard.requestAction | Clipboard.peekAction
+                | Clipboard.notifyAction | Clipboard.provideAction,
+            body: sizes))
+        var reply = try await Self.awaitSent(connection, after: sent)
+        XCTAssertEqual(reply, Clipboard.capsMessage())
+        sent += reply.count
+
+        // Local copy: announced, not sent as Latin-1 ClientCutText.
+        try await session.sendClipboardText("你好\n世界 🎉")
+        reply = try await Self.awaitSent(connection, after: sent)
+        XCTAssertEqual(reply, Clipboard.notifyMessage(hasText: true))
+        sent += reply.count
+
+        // The server asks for it when something pastes.
+        await connection.enqueueServerBytes(Clipboard.message(
+            type: Clipboard.serverCutTextType,
+            flags: Clipboard.requestAction | Clipboard.textFormat, body: Data()))
+        reply = try await Self.awaitSent(connection, after: sent)
+        XCTAssertEqual(reply.prefix(4), Data([6, 0, 0, 0]))
+        let provided = try Clipboard.parse(reply.dropFirst(8))
+        XCTAssertEqual(provided, .provide(text: "你好\n世界 🎉"))
+        let stream = try RFBZlibStreamInflater().decompress(
+            Data(reply.dropFirst(12)), maxOutputSize: 1024)
+        XCTAssertEqual(stream.dropFirst(4),
+                       Data("你好\r\n世界 🎉".utf8) + Data([0]),
+                       "text must be CRLF and NUL-terminated on the wire")
+        sent += reply.count
+
+        // Remote copy: notify -> request -> provide -> clipboard event.
+        await connection.enqueueServerBytes(Clipboard.message(
+            type: Clipboard.serverCutTextType,
+            flags: Clipboard.notifyAction | Clipboard.textFormat, body: Data()))
+        reply = try await Self.awaitSent(connection, after: sent)
+        XCTAssertEqual(reply, Clipboard.requestMessage())
+        var serverText = Data()
+        let remote = Data("中文\r\n第二行".utf8) + Data([0])
+        Self.appendUInt32(UInt32(remote.count), to: &serverText)
+        serverText.append(remote)
+        await connection.enqueueServerBytes(Clipboard.message(
+            type: Clipboard.serverCutTextType,
+            flags: Clipboard.provideAction | Clipboard.textFormat,
+            body: try AppleClipboardProtocol.compress(serverText)))
+        let received = await Self.withTimeout(seconds: 5) { () -> String? in
+            for await event in session.events {
+                if case .clipboardText(let text) = event { return text }
+            }
+            return nil
+        }
+        XCTAssertEqual(received, "中文\n第二行")
+        await session.disconnect()
+    }
+
+    /// Without caps from the server the legacy message stays in use.
+    func testClipboardStaysLegacyWithoutExtendedClipboardCaps() async throws {
+        let (session, connection) = try await Self.connectedConventionalSession()
+        let sent = await connection.sentBytes().count
+        try await session.sendClipboardText("plain")
+        let reply = try await Self.awaitSent(connection, after: sent)
+        XCTAssertEqual(reply, ClientMessage.clientCutText("plain").serialize())
+        await session.disconnect()
+    }
+
+    func testOversizedExtendedClipboardLengthTerminatesWithProtocolViolation() async throws {
+        let (session, connection) = try await Self.connectedConventionalSession()
+        // Int32.min: a 2 GiB extended payload.
+        await connection.enqueueServerBytes(Data([3, 0, 0, 0, 0x80, 0, 0, 0]))
+        let observedError = await Self.withTimeout(seconds: 2) {
+            () -> VNCProtocolError? in
+            for await event in session.events {
+                if case .error(let error) = event { return error }
+            }
+            return nil
+        }
+        guard case .protocolViolation = observedError else {
+            return XCTFail("Expected protocolViolation, got \(String(describing: observedError))")
+        }
+        await session.disconnect()
+    }
+
+    private static func connectedConventionalSession() async throws
+        -> (TransportSession, ScriptedRFBConnection) {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(serverInitMessage(width: 640, height: 480, name: "tigervnc"))
+        await connection.enqueueServerBytes(script)
+        let session = TransportSession(
+            host: "tigervnc.test", port: 5901, password: "",
+            preferredEncodings: [.raw], connection: connection)
+        try await session.connect()
+        return (session, connection)
+    }
+
+    /// Bytes the client sent after the first `offset`, once there are some.
+    private static func awaitSent(
+        _ connection: ScriptedRFBConnection, after offset: Int
+    ) async throws -> Data {
+        for _ in 0..<200 {
+            let sent = await connection.sentBytes()
+            if sent.count > offset { return Data(sent.dropFirst(offset)) }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("client sent nothing after byte \(offset)")
+        return Data()
+    }
+
+    private static func appendUInt32(_ value: UInt32, to data: inout Data) {
+        data.append(contentsOf: [UInt8(value >> 24), UInt8((value >> 16) & 0xFF),
+                                 UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)])
     }
 
     func testAppleStandardOneDisplayActivatesAutoUpdatesAfterEitherInitialRectangleOrder() async throws {

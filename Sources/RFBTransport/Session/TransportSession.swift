@@ -724,6 +724,15 @@ public actor TransportSession {
     private var appleServerCapabilities: AppleServerCapabilities?
     private var appleClipboardRequestID: UInt32 = 0
     private var appleSharedClipboardEnabled = false
+    /// Extended Clipboard flags announced by a conventional server; nil until
+    /// then, and for servers without the extension or without text, which
+    /// keep legacy ClientCutText.
+    private var extendedClipboardServerFlags: UInt32?
+    /// Largest text the server takes without asking; TigerVNC sends 0, so
+    /// it only gets text it requests.
+    private var extendedClipboardServerUnrequestedTextLimit = 0
+    /// Local text announced to the server, provided when it asks for it.
+    private var extendedClipboardLocalText: String?
     /// A regular RFB server may receive SetDesktopSize only after it sends an
     /// ExtendedDesktopSize rectangle. Retain that screen identity and any
     /// early client-size request until the announcement arrives.
@@ -1111,10 +1120,36 @@ public actor TransportSession {
         if Self.shouldUseApplePackedClipboard(
             capabilities: appleServerCapabilities) {
             payload = try AppleClipboardProtocol.packedTextMessage(text)
+        } else if let flags = extendedClipboardServerFlags {
+            // Announce first: TigerVNC drops data from a client that has not
+            // announced, and asks for it when an application pastes.
+            extendedClipboardLocalText = text
+            if flags & ExtendedClipboardProtocol.notifyAction != 0 {
+                payload = ExtendedClipboardProtocol.notifyMessage(hasText: true)
+            } else if let provide = extendedClipboardProvide(
+                text, limit: extendedClipboardServerUnrequestedTextLimit) {
+                payload = provide
+            } else {
+                return
+            }
         } else {
             payload = ClientMessage.clientCutText(text).serialize()
         }
         try await sendClientPayload(payload)
+    }
+
+    /// nil, logged, when the text exceeds `limit`.
+    private func extendedClipboardProvide(
+        _ text: String,
+        limit: Int = ExtendedClipboardProtocol.maximumTextSize
+    ) -> Data? {
+        do {
+            return try ExtendedClipboardProtocol.provideMessage(
+                text, limit: limit)
+        } catch {
+            log.warning("Not sending clipboard: " + error.localizedDescription)
+            return nil
+        }
     }
 
     public var supportsRemoteClipboardRequest: Bool {
@@ -1715,6 +1750,7 @@ public actor TransportSession {
         append(.xCursor)
         append(.desktopSize)
         append(.extendedDesktopSize)
+        append(.extendedClipboard)
         // This list is a rewrite, not an addition, so the cursor fallbacks
         // have to be withheld here as well or a conventional server would
         // start sending shapes the configured list already declined.
@@ -2696,10 +2732,29 @@ public actor TransportSession {
     private func handleServerCutText() async throws {
         // padding(3) + length(4) = 7 bytes
         let headerData = try await readControlChannel(exactly: 7)
-        let length = UInt32(headerData[headerData.startIndex + 3]) << 24
+        let rawLength = UInt32(headerData[headerData.startIndex + 3]) << 24
                    | UInt32(headerData[headerData.startIndex + 4]) << 16
                    | UInt32(headerData[headerData.startIndex + 5]) << 8
                    | UInt32(headerData[headerData.startIndex + 6])
+        // A negative length marks an Extended Clipboard message.
+        let signedLength = Int32(bitPattern: rawLength)
+        if signedLength < 0 {
+            let payloadLength = Int(signedLength.magnitude)
+            guard payloadLength <= Self.maxAuxiliaryPayloadBytes else {
+                throw oversizedPayloadError(
+                    payloadLength, limit: Self.maxAuxiliaryPayloadBytes,
+                    context: "Extended clipboard")
+            }
+            guard payloadLength >= 4 else {
+                throw VNCProtocolError.protocolViolation(
+                    "Extended clipboard message of \(payloadLength) bytes "
+                        + "has no flags")
+            }
+            try await handleExtendedClipboard(
+                readControlChannel(exactly: payloadLength))
+            return
+        }
+        let length = rawLength
 
         guard Int(length) <= Self.maxAuxiliaryPayloadBytes else {
             throw oversizedPayloadError(
@@ -2713,6 +2768,48 @@ public actor TransportSession {
 
         let actions = stateMachine.handle(event: .receivedServerCutText(text))
         for action in actions { await executeActionNoThrow(action) }
+    }
+
+    /// The message is already off the wire, so a malformed one is logged and
+    /// dropped rather than ending the session.
+    private func handleExtendedClipboard(_ payload: Data) async throws {
+        let message: ExtendedClipboardProtocol.Message
+        do {
+            message = try ExtendedClipboardProtocol.parse(payload)
+        } catch {
+            log.warning("Ignoring extended clipboard message: "
+                + error.localizedDescription)
+            return
+        }
+        typealias Clipboard = ExtendedClipboardProtocol
+        switch message {
+        case .caps(let flags, let textLimit):
+            guard flags & Clipboard.textFormat != 0, let textLimit else {
+                extendedClipboardServerFlags = nil
+                return
+            }
+            extendedClipboardServerFlags = flags
+            extendedClipboardServerUnrequestedTextLimit = textLimit
+            try await sendClientPayload(Clipboard.capsMessage())
+        case .request(let formats):
+            guard formats & Clipboard.textFormat != 0,
+                  let text = extendedClipboardLocalText,
+                  let provide = extendedClipboardProvide(text) else { return }
+            try await sendClientPayload(provide)
+        case .peek:
+            try await sendClientPayload(Clipboard.notifyMessage(
+                hasText: extendedClipboardLocalText != nil))
+        case .notify(let formats):
+            guard formats & Clipboard.textFormat != 0,
+                  let flags = extendedClipboardServerFlags,
+                  flags & Clipboard.requestAction != 0 else { return }
+            try await sendClientPayload(Clipboard.requestMessage())
+        case .provide(let text):
+            guard let text else { return }
+            let actions = stateMachine.handle(
+                event: .receivedServerCutText(text))
+            for action in actions { await executeActionNoThrow(action) }
+        }
     }
 
     private func handleApplePackedClipboard() async throws {

@@ -25,6 +25,9 @@ public enum Encoding: Sendable, Equatable, Hashable {
     case lastRect
     case desktopSize
     case extendedDesktopSize
+    /// Extended Clipboard (0xC0A1E5CE): UTF-8 clipboard text, where the
+    /// legacy cut-text messages are ISO 8859-1.
+    case extendedClipboard
 
     // MARK: - Apple encodings
 
@@ -63,6 +66,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case .lastRect:             return -224
         case .desktopSize:          return -223
         case .extendedDesktopSize:  return -308
+        case .extendedClipboard:    return Int32(bitPattern: 0xC0A1_E5CE)
         case .appleJPEG:            return -1000
         case .apple1:               return -261
         case .appleMultiVariantScreenshare: return 1011
@@ -92,6 +96,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case -224:  self = .lastRect
         case -223:  self = .desktopSize
         case -308:  self = .extendedDesktopSize
+        case Int32(bitPattern: 0xC0A1_E5CE): self = .extendedClipboard
         case -1000: self = .appleJPEG
         case -261:  self = .apple1
         case 1002:  self = .appleSubZlibThousands
@@ -177,6 +182,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case .lastRect:             return "LastRect"
         case .desktopSize:          return "DesktopSize"
         case .extendedDesktopSize:  return "ExtendedDesktopSize"
+        case .extendedClipboard:    return "ExtendedClipboard"
         case .appleJPEG:            return "Apple JPEG"
         case .apple1:               return "Apple Extension"
         case .appleMultiVariantScreenshare: return "Apple Adaptive DCT"

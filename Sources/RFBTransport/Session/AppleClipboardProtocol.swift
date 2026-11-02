@@ -202,7 +202,9 @@ enum AppleClipboardProtocol {
         data.append(UInt8(value & 0xFF))
     }
 
-    private static func compress(_ input: Data) throws -> Data {
+    /// zlib-wrapped DEFLATE ending at a `Z_SYNC_FLUSH` boundary. Also used by
+    /// `ExtendedClipboardProtocol`, whose peers read exactly this form.
+    static func compress(_ input: Data) throws -> Data {
         var stream = z_stream()
         let initializeStatus = deflateInit_(
             &stream,
@@ -211,7 +213,7 @@ enum AppleClipboardProtocol {
             Int32(MemoryLayout<z_stream>.size))
         guard initializeStatus == Z_OK else {
             throw VNCProtocolError.ioError(
-                "Could not initialize Apple clipboard zlib stream "
+                "Could not initialize clipboard zlib stream "
                     + "(status \(initializeStatus))")
         }
         defer { deflateEnd(&stream) }
@@ -229,7 +231,7 @@ enum AppleClipboardProtocol {
             guard let inputBase = inputBytes
                 .bindMemory(to: Bytef.self).baseAddress else {
                 throw VNCProtocolError.ioError(
-                    "Could not access Apple clipboard bytes")
+                    "Could not access clipboard bytes")
             }
             stream.next_in = UnsafeMutablePointer(mutating: inputBase)
             stream.avail_in = uInt(input.count)
@@ -249,7 +251,7 @@ enum AppleClipboardProtocol {
                 guard status == Z_OK,
                       produced > 0 || stream.avail_in < inputBefore else {
                     throw VNCProtocolError.ioError(
-                        "Could not compress Apple clipboard "
+                        "Could not compress clipboard "
                             + "(zlib status \(status))")
                 }
                 output.append(chunk.prefix(produced))
